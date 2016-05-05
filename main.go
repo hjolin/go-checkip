@@ -8,33 +8,26 @@ import (
 	"fmt"
 	"github.com/golang/glog"
 	"io/ioutil"
-	"net/http"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
-	"strings"
 	"time"
 )
 
 type config struct {
 	Concurrency int
-	Httptimeout int
 	Server      []string
 }
 
 var (
-	httpOkIPList []IP
-	conf         config
-	cacertPool   *x509.CertPool
-	tlsConfig    = &tls.Config{
+	tlsOkIPList []IP
+	conf        config
+	cacertPool  *x509.CertPool
+
+	tlsConfig = &tls.Config{
 		RootCAs:            cacertPool,
 		InsecureSkipVerify: true,
-	}
-
-	httpClient = http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-		},
 	}
 )
 
@@ -46,7 +39,6 @@ func init() {
 	checkErr(err)
 	cacertPool = x509.NewCertPool()
 	cacertPool.AppendCertsFromPEM(cacertFile)
-	httpClient.Timeout = time.Millisecond * time.Duration(conf.Httptimeout)
 }
 
 func checkErr(err error) {
@@ -55,51 +47,56 @@ func checkErr(err error) {
 	}
 }
 
-func httpCheckip(ip string, sem chan bool) {
+func tlsCheckip(ip string, sem chan bool) {
 	defer func() { <-sem }()
-	start := time.Now()
-	resp, err := httpClient.Head(fmt.Sprintf("https://%s", ip))
-	end := time.Now()
+	dialer := net.Dialer{
+		KeepAlive: 0,
+		Timeout:   time.Millisecond * 7000,
+		DualStack: false,
+	}
+	conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:443", ip))
 
 	if err != nil {
-		if !strings.Contains(err.Error(), "www.google.com") {
-			glog.Infof("%s  %s", ip, err)
-			return
-		}
-		checkedip := IP{
-			addr:       ip,
-			commonName: "google.com",
-			orgName:    "Google Inc",
-			serverName: "gws",
-			timeDelay:  int(end.Sub(start).Seconds() * 1000),
-		}
-		glog.Infof("%s  %s  %d", checkedip.addr, checkedip.serverName, checkedip.timeDelay)
+		glog.Infoln(err)
+		return
+	}
+	defer conn.Close()
 
-		if strInSlice(checkedip.serverName, conf.Server) {
-			httpOkIPList = append(httpOkIPList, checkedip)
-		}
+	start := time.Now()
+	tlsClient := tls.Client(conn, tlsConfig)
+	if err = tlsClient.Handshake(); err != nil {
+		glog.Infoln(err)
+	}
+	end := time.Now()
+
+	if tlsClient.ConnectionState().PeerCertificates == nil {
 		return
 	}
 
-	peerCertSubject := resp.TLS.PeerCertificates[0].Subject
+	peerCertSubject := tlsClient.ConnectionState().PeerCertificates[0].Subject
 	commonName := peerCertSubject.CommonName
-	orgName := ""
-	if len(peerCertSubject.Organization) > 0 {
-		orgName = peerCertSubject.Organization[0]
-	}
-	serverName := resp.Header.Get("Server")
+	orgName := peerCertSubject.Organization[0]
+
 	checkedip := IP{
 		addr:       ip,
 		commonName: commonName,
 		orgName:    orgName,
-		serverName: serverName,
 		timeDelay:  int(end.Sub(start).Seconds() * 1000),
 	}
 
-	glog.Infof("%s  %s  %d", checkedip.addr, checkedip.serverName, checkedip.timeDelay)
+	if checkedip.orgName == "Google Inc" {
+		if checkedip.commonName == "google.com" {
+			checkedip.serverName = "gws"
+		} else if checkedip.commonName == "*.c.docs.google.com" || checkedip.commonName == "*.googlevideo.com" {
+			checkedip.serverName = "gvs 1.0"
+		}
+	} else {
+		return
+	}
+	glog.Infof("%s  %s  %s  %d", checkedip.addr, checkedip.commonName, checkedip.serverName, checkedip.timeDelay)
 
 	if strInSlice(checkedip.serverName, conf.Server) {
-		httpOkIPList = append(httpOkIPList, checkedip)
+		tlsOkIPList = append(tlsOkIPList, checkedip)
 	}
 
 }
@@ -116,7 +113,7 @@ func strInSlice(str string, strslice []string) bool {
 func main() {
 	defer writeOKIPFile()
 
-	fmt.Printf("Concurrency: %d%sHttptimeout: %d%s", conf.Concurrency, sep, conf.Httptimeout, sep)
+	fmt.Printf("Concurrency: %d%s", conf.Concurrency, sep)
 	fmt.Printf("%#v%s", conf.Server, sep)
 
 	c := make(chan os.Signal, 1)
@@ -138,21 +135,21 @@ func main() {
 
 	for _, ip := range ipstrlist {
 		sem <- true
-		go httpCheckip(ip, sem)
+		go tlsCheckip(ip, sem)
 	}
 
 	for i := 0; i < cap(sem); i++ {
 		sem <- true
 	}
 
-	println(len(httpOkIPList))
+	println(len(tlsOkIPList))
 
 }
 
 func writeOKIPFile() {
-	if len(httpOkIPList) > 0 {
+	if len(tlsOkIPList) > 0 {
 		okips := &IPList{
-			IPList: httpOkIPList,
+			IPList: tlsOkIPList,
 		}
 		sort.Sort(okips)
 		writeOKIP(*okips)
